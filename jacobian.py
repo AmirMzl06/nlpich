@@ -18,6 +18,7 @@ import cebra.attribution
 # helpers
 # =====================================================================
 def reduce_attr_map(arr):
+    print("BEFORE REDUCE:", arr.shape)
     if torch.is_tensor(arr):
         arr = arr.detach().cpu().numpy()
     arr = np.abs(np.asarray(arr))
@@ -25,6 +26,8 @@ def reduce_attr_map(arr):
         arr = arr.mean(axis=0)
     elif arr.ndim == 1:
         arr = arr[None, :]
+    
+    print("AFTER REDUCE:", arr.shape)
     return arr.astype(np.float32)
 
 
@@ -194,7 +197,17 @@ def run_attribution_for_stage(model, x_ref, stage, out_dim, out_dir, device, tag
 
     jf = result["jf"]
     jf_inv = result.get("jf-inv-svd", result.get("jf-inv-lsq", result.get("jf-inv")))
-
+    print("========== ATTR SHAPES ==========")
+    print("x_ref shape:", x_ref.shape)
+    print("result keys:", result.keys())
+    print("jf type:", type(jf))
+    print("jf shape:", jf.shape if hasattr(jf, "shape") else None)
+    
+    print("jf_inv type:", type(jf_inv))
+    print("jf_inv shape:", jf_inv.shape if hasattr(jf_inv, "shape") else None)
+    print("=================================")
+    
+    
     torch.save(jf, os.path.join(out_dir, f"{tag}_{stage}_jf.pt"))
     torch.save(jf_inv, os.path.join(out_dir, f"{tag}_{stage}_jf_inv.pt"))
 
