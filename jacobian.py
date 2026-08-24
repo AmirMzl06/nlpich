@@ -70,7 +70,11 @@ class EncoderDecoderStageWrapper(nn.Module):
         ed = self.ed
         lengths = torch.tensor([x.shape[1]] * x.shape[0], device=x.device)
 
+        # h = ed.smoother(x)
+        x = x.transpose(1,2)
+        print("TRANSPOSED:", x.shape)
         h = ed.smoother(x)
+        
         if ed.cebra_unfolder:
             h = ed._apply_cebra(h, lengths)
             h, lengths = ed.unfolder(h, lengths)
