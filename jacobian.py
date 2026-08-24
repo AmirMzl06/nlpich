@@ -66,12 +66,13 @@ class EncoderDecoderStageWrapper(nn.Module):
         self.stage = stage
 
     def forward(self, x):
+        if x.dim() == 2:
+            x = x.unsqueeze(0) 
         ed = self.ed
         lengths = torch.tensor(
             [x.shape[1]] * x.shape[0],
             device=x.device
         )
-        # SAME AS ORIGINAL FORWARD
         x = ed.smoother(x)
         if ed.cebra_unfolder:
             x = ed._apply_cebra(x, lengths)
@@ -79,13 +80,16 @@ class EncoderDecoderStageWrapper(nn.Module):
         if not ed.cebra_unfolder:
             x = ed._apply_cebra(x, lengths)
         if self.stage == "cebra":
-            return x
-        x, _ = ed.rnn(x)
-        if self.stage == "rnn":
-            return x
-        x = ed.final_decoder(x)
-        return x
-        
+            out = x
+        else:
+            x, _ = ed.rnn(x)
+            if self.stage == "rnn":
+                out = x
+            else:
+                out = ed.final_decoder(x)
+        if out.dim() == 3:
+            out = out.squeeze(0) 
+        return out
 # class EncoderDecoderStageWrapper(nn.Module):
 #     def __init__(self, encoder_decoder, stage="cebra"):
 #         super().__init__()
@@ -210,7 +214,8 @@ def run_attribution_for_stage(model, x_ref, stage, out_dim, out_dir, device, tag
     wrapper = EncoderDecoderStageWrapper(model, stage=stage).to(device)
     wrapper.eval()
 
-    x_tensor = x_ref.clone().detach().to(device)
+    x_ref_2d = x_ref.squeeze(0) if x_ref.dim() == 3 else x_ref   # (1,T,F) -> (T,F)
+    x_tensor = x_ref_2d.clone().detach().to(device)
     x_tensor.requires_grad_(True)
 
     method = cebra.attribution.init(
