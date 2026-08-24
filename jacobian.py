@@ -186,7 +186,11 @@ def run_attribution_for_stage(model, x_ref, stage, out_dim, out_dir, device, tag
         output_dimension=out_dim,
     )
     # batch_size = number of SAMPLES (x_tensor.shape[0]), not sequence length
-    result = method.compute_attribution_map(batch_size=x_tensor.shape[0])
+    # result = method.compute_attribution_map(batch_size=x_tensor.shape[0])
+    with torch.backends.cudnn.flags(enabled=False):
+        result = method.compute_attribution_map(
+            batch_size=x_tensor.shape[0]
+        )
 
     jf = result["jf"]
     jf_inv = result.get("jf-inv-svd", result.get("jf-inv-lsq", result.get("jf-inv")))
