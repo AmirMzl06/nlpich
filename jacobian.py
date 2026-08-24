@@ -195,6 +195,9 @@ def run_attribution_for_stage(model, x_ref, stage, out_dim, out_dir, device, tag
             batch_size=x_tensor.shape[0]
         )
 
+    print("input shape:", x_tensor.shape)
+    print("jf raw:", result["jf"].shape)
+
     jf = result["jf"]
     jf_inv = result.get("jf-inv-svd", result.get("jf-inv-lsq", result.get("jf-inv")))
     print("========== ATTR SHAPES ==========")
