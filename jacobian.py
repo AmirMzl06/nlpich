@@ -62,35 +62,62 @@ def cleanup(*objs):
 class EncoderDecoderStageWrapper(nn.Module):
     def __init__(self, encoder_decoder, stage="cebra"):
         super().__init__()
-        assert stage in ("cebra", "rnn", "logits")
         self.ed = encoder_decoder
         self.stage = stage
 
     def forward(self, x):
         ed = self.ed
-        lengths = torch.tensor([x.shape[1]] * x.shape[0], device=x.device)
-
-        # h = ed.smoother(x)
-        x = x.transpose(1,2)
-        print("TRANSPOSED:", x.shape)
-        h = ed.smoother(x)
-        
+        lengths = torch.tensor(
+            [x.shape[1]] * x.shape[0],
+            device=x.device
+        )
+        # SAME AS ORIGINAL FORWARD
+        x = ed.smoother(x)
         if ed.cebra_unfolder:
-            h = ed._apply_cebra(h, lengths)
-            h, lengths = ed.unfolder(h, lengths)
-        else:
-            h, lengths = ed.unfolder(h, lengths)
-            h = ed._apply_cebra(h, lengths)
-
+            x = ed._apply_cebra(x, lengths)
+        x, lengths = ed.unfolder(x, lengths)
+        if not ed.cebra_unfolder:
+            x = ed._apply_cebra(x, lengths)
         if self.stage == "cebra":
-            return h
-
-        h, _ = ed.rnn(h)
+            return x
+        x, _ = ed.rnn(x)
         if self.stage == "rnn":
-            return h
+            return x
+        x = ed.final_decoder(x)
+        return x
+        
+# class EncoderDecoderStageWrapper(nn.Module):
+#     def __init__(self, encoder_decoder, stage="cebra"):
+#         super().__init__()
+#         assert stage in ("cebra", "rnn", "logits")
+#         self.ed = encoder_decoder
+#         self.stage = stage
 
-        h = ed.final_decoder(h)
-        return h
+#     def forward(self, x):
+#         ed = self.ed
+#         lengths = torch.tensor([x.shape[1]] * x.shape[0], device=x.device)
+
+#         # h = ed.smoother(x)
+#         x = x.transpose(1,2)
+#         print("TRANSPOSED:", x.shape)
+#         h = ed.smoother(x)
+        
+#         if ed.cebra_unfolder:
+#             h = ed._apply_cebra(h, lengths)
+#             h, lengths = ed.unfolder(h, lengths)
+#         else:
+#             h, lengths = ed.unfolder(h, lengths)
+#             h = ed._apply_cebra(h, lengths)
+
+#         if self.stage == "cebra":
+#             return h
+
+#         h, _ = ed.rnn(h)
+#         if self.stage == "rnn":
+#             return h
+
+#         h = ed.final_decoder(h)
+#         return h
 
 
 # =====================================================================
