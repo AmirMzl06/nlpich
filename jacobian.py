@@ -338,6 +338,7 @@ import matplotlib.pyplot as plt
 
 from utils.model import Encoder_Decoder
 from utils.dataset import SpeechDataset, HandwritingDataset
+from utils.data_loader import get_input as get_nlp21_input
 
 import cebra
 import cebra.attribution
@@ -511,30 +512,194 @@ def day_trial_to_flat_index(test_days, day_idx, trial_in_day):
     return offset + trial_in_day
 
 
-def get_reference_trial(model_args, device, trial_index=None, day_idx=None, trial_in_day=None):
-    with open(model_args["datasetPath"], "rb") as f:
-        loadedData = pickle.load(f)
+# def get_reference_trial(model_args, device, trial_index=None, day_idx=None, trial_in_day=None):
+#     with open(model_args["datasetPath"], "rb") as f:
+#         loadedData = pickle.load(f)
 
+#     gauss_in = model_args.get("gauss_in", True)
+#     is_speech = model_args.get("is_speech", True)
+
+#     if is_speech:
+#         # gauss=not gauss_in: avoids double-smoothing when the model already
+#         # smooths internally (gauss_in=True), matching trainer.py exactly.
+#         test_ds = SpeechDataset(loadedData["test"], gauss=not gauss_in)
+#     else:
+#         test_ds = HandwritingDataset(loadedData["test"])
+
+#     if day_idx is not None:
+#         trial_index = day_trial_to_flat_index(loadedData["test"], day_idx, trial_in_day or 0)
+#         print(f"day_idx={day_idx}, trial_in_day={trial_in_day or 0} -> flat trial_index={trial_index}")
+#     elif trial_index is None:
+#         trial_index = 0
+
+#     x, y, x_len, y_len, day = test_ds[trial_index]
+#     print(f"reference trial: flat_index={trial_index} (belongs to day={day})")
+#     return x.unsqueeze(0).to(device)  # (1, T, F)
+
+def get_reference_trial(
+    model_args,
+    device,
+    trial_index=None,
+    day_idx=None,
+    trial_in_day=None,
+):
+    dataset_path = model_args["datasetPath"]
     gauss_in = model_args.get("gauss_in", True)
     is_speech = model_args.get("is_speech", True)
 
+    # ==========================================================
+    # SPEECH
+    # ==========================================================
     if is_speech:
-        # gauss=not gauss_in: avoids double-smoothing when the model already
-        # smooths internally (gauss_in=True), matching trainer.py exactly.
-        test_ds = SpeechDataset(loadedData["test"], gauss=not gauss_in)
-    else:
-        test_ds = HandwritingDataset(loadedData["test"])
+        with open(dataset_path, "rb") as f:
+            loadedData = pickle.load(f)
 
+        test_ds = SpeechDataset(
+            loadedData["test"],
+            gauss=not gauss_in
+        )
+
+        if day_idx is not None:
+            trial_index = day_trial_to_flat_index(
+                loadedData["test"],
+                day_idx,
+                trial_in_day or 0,
+            )
+
+            print(
+                f"speech: day_idx={day_idx}, "
+                f"trial_in_day={trial_in_day or 0} "
+                f"-> flat trial_index={trial_index}"
+            )
+
+        elif trial_index is None:
+            trial_index = 0
+
+        x, y, x_len, y_len, day = test_ds[trial_index]
+
+        print(
+            f"reference speech trial: "
+            f"flat_index={trial_index}, day={day}, "
+            f"shape={tuple(x.shape)}"
+        )
+
+        return x.unsqueeze(0).to(device)
+
+    # ==========================================================
+    # NLP21
+    # ==========================================================
+    print("Loading NLP21 evaluation data from directory:")
+    print(dataset_path)
+
+    eval_dirs = [
+        (
+            "no_recalibration",
+            os.path.join(
+                dataset_path,
+                "online_evaluation_data",
+                "no_recalibration",
+                "mat",
+            ),
+        ),
+        (
+            "recalibration",
+            os.path.join(
+                dataset_path,
+                "online_evaluation_data",
+                "recalibration",
+                "mat",
+            ),
+        ),
+    ]
+
+    # Each entry will correspond to ONE .mat file/session
+    sessions = []
+
+    for split_name, path in eval_dirs:
+        print(f"loading {split_name}: {path}")
+
+        items, borders = get_nlp21_input(
+            path,
+            norm=True,
+            gauss=not gauss_in,
+            train=False,
+            valid=False,
+            return_borders=True,
+            gauss_sigma=2.0,
+        )
+
+        # borders contains start index of each .mat file
+        ends = borders[1:] + [len(items)]
+
+        for file_idx, (start, end) in enumerate(zip(borders, ends)):
+            sessions.append(
+                {
+                    "split": split_name,
+                    "file_idx": file_idx,
+                    "items": items[start:end],
+                }
+            )
+
+    print(f"Found {len(sessions)} NLP21 sessions/files")
+
+    # ----------------------------------------------------------
+    # day_idx means .mat/session index here
+    # ----------------------------------------------------------
     if day_idx is not None:
-        trial_index = day_trial_to_flat_index(loadedData["test"], day_idx, trial_in_day or 0)
-        print(f"day_idx={day_idx}, trial_in_day={trial_in_day or 0} -> flat trial_index={trial_index}")
-    elif trial_index is None:
-        trial_index = 0
+        if day_idx < 0 or day_idx >= len(sessions):
+            raise ValueError(
+                f"day_idx={day_idx} invalid. "
+                f"Available session indices: 0..{len(sessions)-1}"
+            )
 
-    x, y, x_len, y_len, day = test_ds[trial_index]
-    print(f"reference trial: flat_index={trial_index} (belongs to day={day})")
-    return x.unsqueeze(0).to(device)  # (1, T, F)
+        sess = sessions[day_idx]
+        items = sess["items"]
 
+        ti = trial_in_day or 0
+
+        if ti < 0 or ti >= len(items):
+            raise ValueError(
+                f"trial_in_day={ti} invalid for session {day_idx}. "
+                f"This session contains {len(items)} trials."
+            )
+
+        x, y, d = items[ti]
+
+        print("==========================================")
+        print("NLP21 reference")
+        print(f"session index : {day_idx}")
+        print(f"split         : {sess['split']}")
+        print(f"file index    : {sess['file_idx']}")
+        print(f"trial         : {ti}")
+        print(f"x shape       : {tuple(x.shape)}")
+        print("==========================================")
+
+    # ----------------------------------------------------------
+    # alternatively choose one flat trial
+    # ----------------------------------------------------------
+    else:
+        flat_items = []
+
+        for sess in sessions:
+            flat_items.extend(sess["items"])
+
+        if trial_index is None:
+            trial_index = 0
+
+        if trial_index < 0 or trial_index >= len(flat_items):
+            raise ValueError(
+                f"trial_index={trial_index} invalid. "
+                f"Total trials={len(flat_items)}"
+            )
+
+        x, y, d = flat_items[trial_index]
+
+        print(
+            f"NLP21 flat reference trial={trial_index}, "
+            f"shape={tuple(x.shape)}"
+        )
+
+    return x.unsqueeze(0).to(device)
 
 # =====================================================================
 # run attribution for one stage
