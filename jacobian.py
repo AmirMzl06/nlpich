@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 
 from utils.model import Encoder_Decoder
 from utils.dataset import SpeechDataset, HandwritingDataset
+from utils.data_loader import get_input as get_nlp21_input
 
 import cebra
 import cebra.attribution
@@ -182,48 +183,206 @@ def day_trial_to_flat_index(test_days, day_idx, trial_in_day):
     return offset + trial_in_day
 
 
-def get_reference_day(model_args, device, day_idx):
-    with open(model_args["datasetPath"], "rb") as f:
-        loadedData = pickle.load(f)
+# def get_reference_day(model_args, device, day_idx):
+#     with open(model_args["datasetPath"], "rb") as f:
+#         loadedData = pickle.load(f)
 
+#     gauss_in = model_args.get("gauss_in", True)
+#     is_speech = model_args.get("is_speech", True)
+
+#     if is_speech:
+#         test_ds = SpeechDataset(
+#             loadedData["test"],
+#             gauss=not gauss_in
+#         )
+#     else:
+#         test_ds = HandwritingDataset(
+#             loadedData["test"]
+#         )
+
+#     day_trials = []
+
+#     n_trials = len(
+#         loadedData["test"][day_idx]["sentenceDat"]
+#     )
+
+#     print(f"day {day_idx}: {n_trials} trials")
+#     for trial_in_day in range(n_trials):
+#         flat_idx = day_trial_to_flat_index(
+#             loadedData["test"],
+#             day_idx,
+#             trial_in_day
+#         )
+#         x, y, x_len, y_len, day = test_ds[flat_idx]
+#         print(
+#             f"trial {trial_in_day}: shape={tuple(x.shape)}"
+#         )
+#         day_trials.append(x)
+#     # concat time dimension
+#     x_day = torch.cat(day_trials, dim=0)
+#     print("==========================")
+#     print("CONNECTED DAY SHAPE:", x_day.shape)
+#     print("==========================")
+#     return x_day.unsqueeze(0).to(device)
+
+def get_reference_day(model_args, device, day_idx):
+    dataset_path = model_args["datasetPath"]
     gauss_in = model_args.get("gauss_in", True)
     is_speech = model_args.get("is_speech", True)
 
+    # ==========================================================
+    # SPEECH
+    # ==========================================================
     if is_speech:
+        with open(dataset_path, "rb") as f:
+            loadedData = pickle.load(f)
+
         test_ds = SpeechDataset(
             loadedData["test"],
             gauss=not gauss_in
         )
-    else:
-        test_ds = HandwritingDataset(
-            loadedData["test"]
+
+        day_trials = []
+
+        n_trials = len(
+            loadedData["test"][day_idx]["sentenceDat"]
         )
 
+        print(f"speech day {day_idx}: {n_trials} trials")
+
+        for trial_in_day in range(n_trials):
+            flat_idx = day_trial_to_flat_index(
+                loadedData["test"],
+                day_idx,
+                trial_in_day
+            )
+
+            x, y, x_len, y_len, day = test_ds[flat_idx]
+
+            print(
+                f"trial {trial_in_day}: shape={tuple(x.shape)}"
+            )
+
+            day_trials.append(x)
+
+        x_day = torch.cat(day_trials, dim=0)
+
+        print("==========================")
+        print("CONNECTED SPEECH DAY SHAPE:", x_day.shape)
+        print("==========================")
+
+        return x_day.unsqueeze(0).to(device)
+
+    # ==========================================================
+    # NLP21
+    # ==========================================================
+    print("Loading NLP21 evaluation data from:")
+    print(dataset_path)
+
+    eval_dirs = [
+        (
+            "no_recalibration",
+            os.path.join(
+                dataset_path,
+                "online_evaluation_data",
+                "no_recalibration",
+                "mat",
+            ),
+        ),
+        (
+            "recalibration",
+            os.path.join(
+                dataset_path,
+                "online_evaluation_data",
+                "recalibration",
+                "mat",
+            ),
+        ),
+    ]
+
+    # Each entry = one .mat file / one session
+    sessions = []
+
+    for split_name, path in eval_dirs:
+        print(f"loading {split_name}: {path}")
+
+        items, borders = get_nlp21_input(
+            path,
+            norm=True,
+            gauss=not gauss_in,
+            train=False,
+            valid=False,
+            return_borders=True,
+            gauss_sigma=2.0,
+        )
+
+        # borders gives beginning of every .mat file
+        ends = borders[1:] + [len(items)]
+
+        for file_idx, (start, end) in enumerate(zip(borders, ends)):
+            sessions.append(
+                {
+                    "split": split_name,
+                    "file_idx": file_idx,
+                    "items": items[start:end],
+                }
+            )
+
+    print(f"Found {len(sessions)} NLP21 sessions/files")
+
+    # ----------------------------------------------------------
+    # day_idx == .mat/session index for NLP21
+    # ----------------------------------------------------------
+    if day_idx is None:
+        day_idx = 0
+
+    if day_idx < 0 or day_idx >= len(sessions):
+        raise ValueError(
+            f"day_idx={day_idx} invalid. "
+            f"Available session indices: 0..{len(sessions)-1}"
+        )
+
+    sess = sessions[day_idx]
+    items = sess["items"]
+
+    print("==========================================")
+    print("NLP21 CONNECTED DAY")
+    print(f"session index : {day_idx}")
+    print(f"split         : {sess['split']}")
+    print(f"file index    : {sess['file_idx']}")
+    print(f"num trials    : {len(items)}")
+    print("==========================================")
+
+    # ----------------------------------------------------------
+    # concatenate ALL trials of this session along time
+    # ----------------------------------------------------------
     day_trials = []
 
-    n_trials = len(
-        loadedData["test"][day_idx]["sentenceDat"]
-    )
+    for trial_idx, item in enumerate(items):
+        x, y, d = item
 
-    print(f"day {day_idx}: {n_trials} trials")
-    for trial_in_day in range(n_trials):
-        flat_idx = day_trial_to_flat_index(
-            loadedData["test"],
-            day_idx,
-            trial_in_day
-        )
-        x, y, x_len, y_len, day = test_ds[flat_idx]
+        if not torch.is_tensor(x):
+            x = torch.as_tensor(x, dtype=torch.float32)
+
         print(
-            f"trial {trial_in_day}: shape={tuple(x.shape)}"
+            f"trial {trial_idx}: shape={tuple(x.shape)}"
         )
-        day_trials.append(x)
-    # concat time dimension
-    x_day = torch.cat(day_trials, dim=0)
-    print("==========================")
-    print("CONNECTED DAY SHAPE:", x_day.shape)
-    print("==========================")
-    return x_day.unsqueeze(0).to(device)
 
+        day_trials.append(x)
+
+    if len(day_trials) == 0:
+        raise RuntimeError(
+            f"NLP21 session {day_idx} contains zero trials."
+        )
+
+    # (T1,192), (T2,192), ... -> (T1+T2+...,192)
+    x_day = torch.cat(day_trials, dim=0)
+
+    print("==========================================")
+    print("CONNECTED NLP21 DAY SHAPE:", x_day.shape)
+    print("==========================================")
+
+    return x_day.unsqueeze(0).to(device)
 
 # =====================================================================
 # run attribution for one stage
