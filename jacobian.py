@@ -1,491 +1,3 @@
-import os
-import pickle
-import argparse
-
-import numpy as np
-import torch
-import torch.nn as nn
-import matplotlib.pyplot as plt
-
-from utils.model import Encoder_Decoder
-from utils.dataset import SpeechDataset, HandwritingDataset
-from utils.data_loader import get_input as get_nlp21_input
-
-import cebra
-import cebra.attribution
-
-
-# =====================================================================
-# helpers
-# =====================================================================
-def reduce_attr_map(arr):
-    print("BEFORE REDUCE:", arr.shape)
-    if torch.is_tensor(arr):
-        arr = arr.detach().cpu().numpy()
-    arr = np.abs(np.asarray(arr))
-    if arr.ndim == 3:       # (samples, out_dim, in_dim) -> average over samples
-        arr = arr.mean(axis=0)
-    elif arr.ndim == 1:
-        arr = arr[None, :]
-    
-    print("AFTER REDUCE:", arr.shape)
-    return arr.astype(np.float32)
-
-
-def save_heatmap(arr, path, title):
-    plt.figure(figsize=(10, 6))
-    plt.imshow(arr, aspect="auto", cmap="viridis")
-    plt.colorbar(label="absolute attribution")
-    plt.xlabel("Input feature")
-    plt.ylabel("Output dimension")
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(path, dpi=300, bbox_inches="tight")
-    plt.close()
-    print("saved:", path)
-
-
-def cleanup(*objs):
-    import gc
-    for o in objs:
-        del o
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-
-
-# =====================================================================
-# wraps Encoder_Decoder so forward(raw_x) returns the output at a chosen
-# intermediate stage -- mirrors Encoder_Decoder.forward exactly, including
-# both cebra_unfolder orderings, so it stays correct for any run's config.
-# =====================================================================
-class EncoderDecoderStageWrapper(nn.Module):
-    def __init__(self, encoder_decoder, stage="cebra"):
-        super().__init__()
-        self.ed = encoder_decoder
-        self.stage = stage
-
-    def forward(self, x):
-        if x.dim() == 2:
-            x = x.unsqueeze(0) 
-        ed = self.ed
-        lengths = torch.tensor(
-            [x.shape[1]] * x.shape[0],
-            device=x.device
-        )
-        x = ed.smoother(x)
-        if ed.cebra_unfolder:
-            x = ed._apply_cebra(x, lengths)
-        x, lengths = ed.unfolder(x, lengths)
-        if not ed.cebra_unfolder:
-            x = ed._apply_cebra(x, lengths)
-        if self.stage == "cebra":
-            out = x
-        else:
-            x, _ = ed.rnn(x)
-            if self.stage == "rnn":
-                out = x
-            else:
-                out = ed.final_decoder(x)
-        if out.dim() == 3:
-            out = out.squeeze(0) 
-        return out
-# class EncoderDecoderStageWrapper(nn.Module):
-#     def __init__(self, encoder_decoder, stage="cebra"):
-#         super().__init__()
-#         assert stage in ("cebra", "rnn", "logits")
-#         self.ed = encoder_decoder
-#         self.stage = stage
-
-#     def forward(self, x):
-#         ed = self.ed
-#         lengths = torch.tensor([x.shape[1]] * x.shape[0], device=x.device)
-
-#         # h = ed.smoother(x)
-#         x = x.transpose(1,2)
-#         print("TRANSPOSED:", x.shape)
-#         h = ed.smoother(x)
-        
-#         if ed.cebra_unfolder:
-#             h = ed._apply_cebra(h, lengths)
-#             h, lengths = ed.unfolder(h, lengths)
-#         else:
-#             h, lengths = ed.unfolder(h, lengths)
-#             h = ed._apply_cebra(h, lengths)
-
-#         if self.stage == "cebra":
-#             return h
-
-#         h, _ = ed.rnn(h)
-#         if self.stage == "rnn":
-#             return h
-
-#         h = ed.final_decoder(h)
-#         return h
-
-
-# =====================================================================
-# rebuild the exact architecture + load trained weights
-# =====================================================================
-def load_trained_model(out_dir, device):
-    with open(os.path.join(out_dir, "args"), "rb") as f:
-        model_args = pickle.load(f)
-
-    is_speech = model_args.get("is_speech", True)
-    is_nejm = model_args.get("is_nejm", False)
-    neural_dim = (256 if not is_nejm else 512) if is_speech else 192
-    num_classes = 41 if is_speech else 32
-
-    model = Encoder_Decoder(
-        neural_dim,
-        model_args["ceb_out"],
-        model_args["kernel"],
-        model_args["stride"],
-        num_classes,
-        model_args["hidden"],
-        model_args["layers"],
-        model_args["dropout"],
-        model_args["bidir"],
-        model_args["cebra_unfolder"],
-        model_args.get("gru", True),
-        2.0,
-        gauss_in=model_args.get("gauss_in", True),
-        no_rnn=model_args.get("no_rnn", False),
-        cebra_bn=model_args.get("ceb_bn", False),
-        cebra_window_10=model_args.get("cebra_window_10", False),
-    ).to(device)
-
-    state = torch.load(os.path.join(out_dir, "modelWeights"), map_location=device)
-    model.load_state_dict(state)
-    model.eval()  # disable dropout so attribution is deterministic
-    print(f"loaded model from {out_dir} | neural_dim={neural_dim} | num_classes={num_classes} "
-          f"| ceb_out={model_args['ceb_out']} | hidden={model_args['hidden']} | bidir={model_args['bidir']} "
-          f"| cebra_unfolder={model_args['cebra_unfolder']} | no_rnn={model_args.get('no_rnn', False)}")
-    return model, model_args
-
-
-# =====================================================================
-# pull ONE real, already-preprocessed trial from the same test split
-# trainer.py used, so smoothing/etc. stay consistent with training
-# =====================================================================
-def day_trial_to_flat_index(test_days, day_idx, trial_in_day):
-    """SpeechDataset flattens all days' trials into one list, in order
-    (day0-trial0, day0-trial1, ..., day1-trial0, ...). This converts a
-    human-readable (day_idx, trial_in_day) into that flat index."""
-    if day_idx >= len(test_days):
-        raise ValueError(f"day_idx={day_idx} out of range, test split has {len(test_days)} days")
-    n_trials_this_day = len(test_days[day_idx]["sentenceDat"])
-    if trial_in_day >= n_trials_this_day:
-        raise ValueError(f"trial_in_day={trial_in_day} out of range, "
-                          f"day {day_idx} only has {n_trials_this_day} trials")
-    offset = sum(len(test_days[d]["sentenceDat"]) for d in range(day_idx))
-    return offset + trial_in_day
-
-
-# def get_reference_day(model_args, device, day_idx):
-#     with open(model_args["datasetPath"], "rb") as f:
-#         loadedData = pickle.load(f)
-
-#     gauss_in = model_args.get("gauss_in", True)
-#     is_speech = model_args.get("is_speech", True)
-
-#     if is_speech:
-#         test_ds = SpeechDataset(
-#             loadedData["test"],
-#             gauss=not gauss_in
-#         )
-#     else:
-#         test_ds = HandwritingDataset(
-#             loadedData["test"]
-#         )
-
-#     day_trials = []
-
-#     n_trials = len(
-#         loadedData["test"][day_idx]["sentenceDat"]
-#     )
-
-#     print(f"day {day_idx}: {n_trials} trials")
-#     for trial_in_day in range(n_trials):
-#         flat_idx = day_trial_to_flat_index(
-#             loadedData["test"],
-#             day_idx,
-#             trial_in_day
-#         )
-#         x, y, x_len, y_len, day = test_ds[flat_idx]
-#         print(
-#             f"trial {trial_in_day}: shape={tuple(x.shape)}"
-#         )
-#         day_trials.append(x)
-#     # concat time dimension
-#     x_day = torch.cat(day_trials, dim=0)
-#     print("==========================")
-#     print("CONNECTED DAY SHAPE:", x_day.shape)
-#     print("==========================")
-#     return x_day.unsqueeze(0).to(device)
-
-def get_reference_day(model_args, device, day_idx):
-    dataset_path = model_args["datasetPath"]
-    gauss_in = model_args.get("gauss_in", True)
-    is_speech = model_args.get("is_speech", True)
-
-    # ==========================================================
-    # SPEECH
-    # ==========================================================
-    if is_speech:
-        with open(dataset_path, "rb") as f:
-            loadedData = pickle.load(f)
-
-        test_ds = SpeechDataset(
-            loadedData["test"],
-            gauss=not gauss_in
-        )
-
-        day_trials = []
-
-        n_trials = len(
-            loadedData["test"][day_idx]["sentenceDat"]
-        )
-
-        print(f"speech day {day_idx}: {n_trials} trials")
-
-        for trial_in_day in range(n_trials):
-            flat_idx = day_trial_to_flat_index(
-                loadedData["test"],
-                day_idx,
-                trial_in_day
-            )
-
-            x, y, x_len, y_len, day = test_ds[flat_idx]
-
-            print(
-                f"trial {trial_in_day}: shape={tuple(x.shape)}"
-            )
-
-            day_trials.append(x)
-
-        x_day = torch.cat(day_trials, dim=0)
-
-        print("==========================")
-        print("CONNECTED SPEECH DAY SHAPE:", x_day.shape)
-        print("==========================")
-
-        return x_day.unsqueeze(0).to(device)
-
-    # ==========================================================
-    # NLP21
-    # ==========================================================
-    print("Loading NLP21 evaluation data from:")
-    print(dataset_path)
-
-    eval_dirs = [
-        (
-            "no_recalibration",
-            os.path.join(
-                dataset_path,
-                "online_evaluation_data",
-                "no_recalibration",
-                "mat",
-            ),
-        ),
-        (
-            "recalibration",
-            os.path.join(
-                dataset_path,
-                "online_evaluation_data",
-                "recalibration",
-                "mat",
-            ),
-        ),
-    ]
-
-    # Each entry = one .mat file / one session
-    sessions = []
-
-    for split_name, path in eval_dirs:
-        print(f"loading {split_name}: {path}")
-
-        items, borders = get_nlp21_input(
-            path,
-            norm=True,
-            gauss=not gauss_in,
-            train=False,
-            valid=False,
-            return_borders=True,
-            gauss_sigma=2.0,
-        )
-
-        # borders gives beginning of every .mat file
-        ends = borders[1:] + [len(items)]
-
-        for file_idx, (start, end) in enumerate(zip(borders, ends)):
-            sessions.append(
-                {
-                    "split": split_name,
-                    "file_idx": file_idx,
-                    "items": items[start:end],
-                }
-            )
-
-    print(f"Found {len(sessions)} NLP21 sessions/files")
-
-    # ----------------------------------------------------------
-    # day_idx == .mat/session index for NLP21
-    # ----------------------------------------------------------
-    if day_idx is None:
-        day_idx = 0
-
-    if day_idx < 0 or day_idx >= len(sessions):
-        raise ValueError(
-            f"day_idx={day_idx} invalid. "
-            f"Available session indices: 0..{len(sessions)-1}"
-        )
-
-    sess = sessions[day_idx]
-    items = sess["items"]
-
-    print("==========================================")
-    print("NLP21 CONNECTED DAY")
-    print(f"session index : {day_idx}")
-    print(f"split         : {sess['split']}")
-    print(f"file index    : {sess['file_idx']}")
-    print(f"num trials    : {len(items)}")
-    print("==========================================")
-
-    # ----------------------------------------------------------
-    # concatenate ALL trials of this session along time
-    # ----------------------------------------------------------
-    day_trials = []
-
-    for trial_idx, item in enumerate(items):
-        x, y, d = item
-
-        if not torch.is_tensor(x):
-            x = torch.as_tensor(x, dtype=torch.float32)
-
-        print(
-            f"trial {trial_idx}: shape={tuple(x.shape)}"
-        )
-
-        day_trials.append(x)
-
-    if len(day_trials) == 0:
-        raise RuntimeError(
-            f"NLP21 session {day_idx} contains zero trials."
-        )
-
-    # (T1,192), (T2,192), ... -> (T1+T2+...,192)
-    x_day = torch.cat(day_trials, dim=0)
-
-    print("==========================================")
-    print("CONNECTED NLP21 DAY SHAPE:", x_day.shape)
-    print("==========================================")
-
-    return x_day.unsqueeze(0).to(device)
-
-# =====================================================================
-# run attribution for one stage
-# =====================================================================
-def run_attribution_for_stage(model, x_ref, stage, out_dim, out_dir, device, tag):
-    wrapper = EncoderDecoderStageWrapper(model, stage=stage).to(device)
-    wrapper.eval()
-
-    x_ref_2d = x_ref.squeeze(0) if x_ref.dim() == 3 else x_ref   # (1,T,F) -> (T,F)
-    x_tensor = x_ref_2d.clone().detach().to(device)
-    x_tensor.requires_grad_(True)
-
-    method = cebra.attribution.init(
-        name="jacobian-based-batched",
-        model=wrapper,
-        input_data=x_tensor,
-        output_dimension=out_dim,
-    )
-    # batch_size = number of SAMPLES (x_tensor.shape[0]), not sequence length
-    # result = method.compute_attribution_map(batch_size=x_tensor.shape[0])
-    with torch.backends.cudnn.flags(enabled=False):
-        result = method.compute_attribution_map(
-            batch_size=x_tensor.shape[0]
-        )
-
-    print("input shape:", x_tensor.shape)
-    print("jf raw:", result["jf"].shape)
-
-    jf = result["jf"]
-    jf_inv = result.get("jf-inv-svd", result.get("jf-inv-lsq", result.get("jf-inv")))
-    print("========== ATTR SHAPES ==========")
-    print("x_ref shape:", x_ref.shape)
-    print("result keys:", result.keys())
-    print("jf type:", type(jf))
-    print("jf shape:", jf.shape if hasattr(jf, "shape") else None)
-    
-    print("jf_inv type:", type(jf_inv))
-    print("jf_inv shape:", jf_inv.shape if hasattr(jf_inv, "shape") else None)
-    print("=================================")
-    
-    
-    torch.save(jf, os.path.join(out_dir, f"{tag}_{stage}_jf.pt"))
-    torch.save(jf_inv, os.path.join(out_dir, f"{tag}_{stage}_jf_inv.pt"))
-
-    save_heatmap(reduce_attr_map(jf), os.path.join(out_dir, f"{tag}_{stage}_jf.png"),
-                 f"{tag} [{stage}] - Jacobian")
-    save_heatmap(reduce_attr_map(jf_inv), os.path.join(out_dir, f"{tag}_{stage}_jf_inv.png"),
-                 f"{tag} [{stage}] - inverse Jacobian")
-
-    
-    cleanup(wrapper, x_tensor, method, result)
-
-
-# =====================================================================
-# main
-# =====================================================================
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--out_dir", required=True, help="same out_dir used for start_trainer.py")
-    parser.add_argument("--stages", nargs="+", default=["cebra", "rnn", "logits"],
-                         choices=["cebra", "rnn", "logits"])
-    parser.add_argument("--trial_index", type=int, default=None,
-                         help="flat index into the whole test split (all days concatenated). "
-                              "Ignored if --day_idx is given.")
-    parser.add_argument("--day_idx", type=int, default=None,
-                         help="pick a specific test-split day (0-based) instead of a flat index")
-    # parser.add_argument("--trial_in_day", type=int, default=0,
-    #                      help="trial index within --day_idx (default: first trial of that day)")
-    parser.add_argument("--tag", type=str, default="attr")
-    cli_args = parser.parse_args()
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    model, model_args = load_trained_model(cli_args.out_dir, device)
-    x_ref = get_reference_day(
-        model_args,
-        device,
-        cli_args.day_idx
-    )
-    print(f"reference trial shape: {tuple(x_ref.shape)}")
-
-    stages = list(cli_args.stages)
-    if model_args.get("no_rnn", False) and "rnn" in stages:
-        print("no_rnn=True for this run -- 'rnn' stage doesn't exist, skipping it")
-        stages = [s for s in stages if s != "rnn"]
-
-    stage_dims = {
-        "cebra": model_args["ceb_out"],
-        "rnn": model_args["hidden"] * (2 if model_args["bidir"] else 1),
-        "logits": 41 if model_args.get("is_speech", True) else 32,
-    }
-
-    for stage in stages:
-        print(f"\n=== attribution: stage={stage} | output_dim={stage_dims[stage]} ===")
-        run_attribution_for_stage(model, x_ref, stage, stage_dims[stage],
-                                   cli_args.out_dir, device, tag=cli_args.tag)
-
-    print("\nDONE")
-
-
-
-
-
 # import os
 # import pickle
 # import argparse
@@ -671,7 +183,7 @@ if __name__ == "__main__":
 #     return offset + trial_in_day
 
 
-# # def get_reference_trial(model_args, device, trial_index=None, day_idx=None, trial_in_day=None):
+# # def get_reference_day(model_args, device, day_idx):
 # #     with open(model_args["datasetPath"], "rb") as f:
 # #         loadedData = pickle.load(f)
 
@@ -679,29 +191,41 @@ if __name__ == "__main__":
 # #     is_speech = model_args.get("is_speech", True)
 
 # #     if is_speech:
-# #         # gauss=not gauss_in: avoids double-smoothing when the model already
-# #         # smooths internally (gauss_in=True), matching trainer.py exactly.
-# #         test_ds = SpeechDataset(loadedData["test"], gauss=not gauss_in)
+# #         test_ds = SpeechDataset(
+# #             loadedData["test"],
+# #             gauss=not gauss_in
+# #         )
 # #     else:
-# #         test_ds = HandwritingDataset(loadedData["test"])
+# #         test_ds = HandwritingDataset(
+# #             loadedData["test"]
+# #         )
 
-# #     if day_idx is not None:
-# #         trial_index = day_trial_to_flat_index(loadedData["test"], day_idx, trial_in_day or 0)
-# #         print(f"day_idx={day_idx}, trial_in_day={trial_in_day or 0} -> flat trial_index={trial_index}")
-# #     elif trial_index is None:
-# #         trial_index = 0
+# #     day_trials = []
 
-# #     x, y, x_len, y_len, day = test_ds[trial_index]
-# #     print(f"reference trial: flat_index={trial_index} (belongs to day={day})")
-# #     return x.unsqueeze(0).to(device)  # (1, T, F)
+# #     n_trials = len(
+# #         loadedData["test"][day_idx]["sentenceDat"]
+# #     )
 
-# def get_reference_trial(
-#     model_args,
-#     device,
-#     trial_index=None,
-#     day_idx=None,
-#     trial_in_day=None,
-# ):
+# #     print(f"day {day_idx}: {n_trials} trials")
+# #     for trial_in_day in range(n_trials):
+# #         flat_idx = day_trial_to_flat_index(
+# #             loadedData["test"],
+# #             day_idx,
+# #             trial_in_day
+# #         )
+# #         x, y, x_len, y_len, day = test_ds[flat_idx]
+# #         print(
+# #             f"trial {trial_in_day}: shape={tuple(x.shape)}"
+# #         )
+# #         day_trials.append(x)
+# #     # concat time dimension
+# #     x_day = torch.cat(day_trials, dim=0)
+# #     print("==========================")
+# #     print("CONNECTED DAY SHAPE:", x_day.shape)
+# #     print("==========================")
+# #     return x_day.unsqueeze(0).to(device)
+
+# def get_reference_day(model_args, device, day_idx):
 #     dataset_path = model_args["datasetPath"]
 #     gauss_in = model_args.get("gauss_in", True)
 #     is_speech = model_args.get("is_speech", True)
@@ -718,36 +242,41 @@ if __name__ == "__main__":
 #             gauss=not gauss_in
 #         )
 
-#         if day_idx is not None:
-#             trial_index = day_trial_to_flat_index(
-#                 loadedData["test"],
-#                 day_idx,
-#                 trial_in_day or 0,
-#             )
+#         day_trials = []
 
-#             print(
-#                 f"speech: day_idx={day_idx}, "
-#                 f"trial_in_day={trial_in_day or 0} "
-#                 f"-> flat trial_index={trial_index}"
-#             )
-
-#         elif trial_index is None:
-#             trial_index = 0
-
-#         x, y, x_len, y_len, day = test_ds[trial_index]
-
-#         print(
-#             f"reference speech trial: "
-#             f"flat_index={trial_index}, day={day}, "
-#             f"shape={tuple(x.shape)}"
+#         n_trials = len(
+#             loadedData["test"][day_idx]["sentenceDat"]
 #         )
 
-#         return x.unsqueeze(0).to(device)
+#         print(f"speech day {day_idx}: {n_trials} trials")
+
+#         for trial_in_day in range(n_trials):
+#             flat_idx = day_trial_to_flat_index(
+#                 loadedData["test"],
+#                 day_idx,
+#                 trial_in_day
+#             )
+
+#             x, y, x_len, y_len, day = test_ds[flat_idx]
+
+#             print(
+#                 f"trial {trial_in_day}: shape={tuple(x.shape)}"
+#             )
+
+#             day_trials.append(x)
+
+#         x_day = torch.cat(day_trials, dim=0)
+
+#         print("==========================")
+#         print("CONNECTED SPEECH DAY SHAPE:", x_day.shape)
+#         print("==========================")
+
+#         return x_day.unsqueeze(0).to(device)
 
 #     # ==========================================================
 #     # NLP21
 #     # ==========================================================
-#     print("Loading NLP21 evaluation data from directory:")
+#     print("Loading NLP21 evaluation data from:")
 #     print(dataset_path)
 
 #     eval_dirs = [
@@ -771,7 +300,7 @@ if __name__ == "__main__":
 #         ),
 #     ]
 
-#     # Each entry will correspond to ONE .mat file/session
+#     # Each entry = one .mat file / one session
 #     sessions = []
 
 #     for split_name, path in eval_dirs:
@@ -787,7 +316,7 @@ if __name__ == "__main__":
 #             gauss_sigma=2.0,
 #         )
 
-#         # borders contains start index of each .mat file
+#         # borders gives beginning of every .mat file
 #         ends = borders[1:] + [len(items)]
 
 #         for file_idx, (start, end) in enumerate(zip(borders, ends)):
@@ -802,63 +331,58 @@ if __name__ == "__main__":
 #     print(f"Found {len(sessions)} NLP21 sessions/files")
 
 #     # ----------------------------------------------------------
-#     # day_idx means .mat/session index here
+#     # day_idx == .mat/session index for NLP21
 #     # ----------------------------------------------------------
-#     if day_idx is not None:
-#         if day_idx < 0 or day_idx >= len(sessions):
-#             raise ValueError(
-#                 f"day_idx={day_idx} invalid. "
-#                 f"Available session indices: 0..{len(sessions)-1}"
-#             )
+#     if day_idx is None:
+#         day_idx = 0
 
-#         sess = sessions[day_idx]
-#         items = sess["items"]
-
-#         ti = trial_in_day or 0
-
-#         if ti < 0 or ti >= len(items):
-#             raise ValueError(
-#                 f"trial_in_day={ti} invalid for session {day_idx}. "
-#                 f"This session contains {len(items)} trials."
-#             )
-
-#         x, y, d = items[ti]
-
-#         print("==========================================")
-#         print("NLP21 reference")
-#         print(f"session index : {day_idx}")
-#         print(f"split         : {sess['split']}")
-#         print(f"file index    : {sess['file_idx']}")
-#         print(f"trial         : {ti}")
-#         print(f"x shape       : {tuple(x.shape)}")
-#         print("==========================================")
-
-#     # ----------------------------------------------------------
-#     # alternatively choose one flat trial
-#     # ----------------------------------------------------------
-#     else:
-#         flat_items = []
-
-#         for sess in sessions:
-#             flat_items.extend(sess["items"])
-
-#         if trial_index is None:
-#             trial_index = 0
-
-#         if trial_index < 0 or trial_index >= len(flat_items):
-#             raise ValueError(
-#                 f"trial_index={trial_index} invalid. "
-#                 f"Total trials={len(flat_items)}"
-#             )
-
-#         x, y, d = flat_items[trial_index]
-
-#         print(
-#             f"NLP21 flat reference trial={trial_index}, "
-#             f"shape={tuple(x.shape)}"
+#     if day_idx < 0 or day_idx >= len(sessions):
+#         raise ValueError(
+#             f"day_idx={day_idx} invalid. "
+#             f"Available session indices: 0..{len(sessions)-1}"
 #         )
 
-#     return x.unsqueeze(0).to(device)
+#     sess = sessions[day_idx]
+#     items = sess["items"]
+
+#     print("==========================================")
+#     print("NLP21 CONNECTED DAY")
+#     print(f"session index : {day_idx}")
+#     print(f"split         : {sess['split']}")
+#     print(f"file index    : {sess['file_idx']}")
+#     print(f"num trials    : {len(items)}")
+#     print("==========================================")
+
+#     # ----------------------------------------------------------
+#     # concatenate ALL trials of this session along time
+#     # ----------------------------------------------------------
+#     day_trials = []
+
+#     for trial_idx, item in enumerate(items):
+#         x, y, d = item
+
+#         if not torch.is_tensor(x):
+#             x = torch.as_tensor(x, dtype=torch.float32)
+
+#         print(
+#             f"trial {trial_idx}: shape={tuple(x.shape)}"
+#         )
+
+#         day_trials.append(x)
+
+#     if len(day_trials) == 0:
+#         raise RuntimeError(
+#             f"NLP21 session {day_idx} contains zero trials."
+#         )
+
+#     # (T1,192), (T2,192), ... -> (T1+T2+...,192)
+#     x_day = torch.cat(day_trials, dim=0)
+
+#     print("==========================================")
+#     print("CONNECTED NLP21 DAY SHAPE:", x_day.shape)
+#     print("==========================================")
+
+#     return x_day.unsqueeze(0).to(device)
 
 # # =====================================================================
 # # run attribution for one stage
@@ -908,6 +432,7 @@ if __name__ == "__main__":
 #     save_heatmap(reduce_attr_map(jf_inv), os.path.join(out_dir, f"{tag}_{stage}_jf_inv.png"),
 #                  f"{tag} [{stage}] - inverse Jacobian")
 
+    
 #     cleanup(wrapper, x_tensor, method, result)
 
 
@@ -924,16 +449,19 @@ if __name__ == "__main__":
 #                               "Ignored if --day_idx is given.")
 #     parser.add_argument("--day_idx", type=int, default=None,
 #                          help="pick a specific test-split day (0-based) instead of a flat index")
-#     parser.add_argument("--trial_in_day", type=int, default=0,
-#                          help="trial index within --day_idx (default: first trial of that day)")
+#     # parser.add_argument("--trial_in_day", type=int, default=0,
+#     #                      help="trial index within --day_idx (default: first trial of that day)")
 #     parser.add_argument("--tag", type=str, default="attr")
 #     cli_args = parser.parse_args()
 
 #     device = "cuda" if torch.cuda.is_available() else "cpu"
 
 #     model, model_args = load_trained_model(cli_args.out_dir, device)
-#     x_ref = get_reference_trial(model_args, device, cli_args.trial_index,
-#                                  cli_args.day_idx, cli_args.trial_in_day)
+#     x_ref = get_reference_day(
+#         model_args,
+#         device,
+#         cli_args.day_idx
+#     )
 #     print(f"reference trial shape: {tuple(x_ref.shape)}")
 
 #     stages = list(cli_args.stages)
@@ -953,6 +481,478 @@ if __name__ == "__main__":
 #                                    cli_args.out_dir, device, tag=cli_args.tag)
 
 #     print("\nDONE")
+
+
+
+
+
+import os
+import pickle
+import argparse
+
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+from utils.model import Encoder_Decoder
+from utils.dataset import SpeechDataset, HandwritingDataset
+from utils.data_loader import get_input as get_nlp21_input
+
+import cebra
+import cebra.attribution
+
+
+# =====================================================================
+# helpers
+# =====================================================================
+def reduce_attr_map(arr):
+    print("BEFORE REDUCE:", arr.shape)
+    if torch.is_tensor(arr):
+        arr = arr.detach().cpu().numpy()
+    arr = np.abs(np.asarray(arr))
+    if arr.ndim == 3:       # (samples, out_dim, in_dim) -> average over samples
+        arr = arr.mean(axis=0)
+    elif arr.ndim == 1:
+        arr = arr[None, :]
+    
+    print("AFTER REDUCE:", arr.shape)
+    return arr.astype(np.float32)
+
+
+def save_heatmap(arr, path, title):
+    plt.figure(figsize=(10, 6))
+    plt.imshow(arr, aspect="auto", cmap="viridis")
+    plt.colorbar(label="absolute attribution")
+    plt.xlabel("Input feature")
+    plt.ylabel("Output dimension")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print("saved:", path)
+
+
+def cleanup(*objs):
+    import gc
+    for o in objs:
+        del o
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
+# =====================================================================
+# wraps Encoder_Decoder so forward(raw_x) returns the output at a chosen
+# intermediate stage -- mirrors Encoder_Decoder.forward exactly, including
+# both cebra_unfolder orderings, so it stays correct for any run's config.
+# =====================================================================
+class EncoderDecoderStageWrapper(nn.Module):
+    def __init__(self, encoder_decoder, stage="cebra"):
+        super().__init__()
+        self.ed = encoder_decoder
+        self.stage = stage
+
+    def forward(self, x):
+        if x.dim() == 2:
+            x = x.unsqueeze(0) 
+        ed = self.ed
+        lengths = torch.tensor(
+            [x.shape[1]] * x.shape[0],
+            device=x.device
+        )
+        x = ed.smoother(x)
+        if ed.cebra_unfolder:
+            x = ed._apply_cebra(x, lengths)
+        x, lengths = ed.unfolder(x, lengths)
+        if not ed.cebra_unfolder:
+            x = ed._apply_cebra(x, lengths)
+        if self.stage == "cebra":
+            out = x
+        else:
+            x, _ = ed.rnn(x)
+            if self.stage == "rnn":
+                out = x
+            else:
+                out = ed.final_decoder(x)
+        if out.dim() == 3:
+            out = out.squeeze(0) 
+        return out
+# class EncoderDecoderStageWrapper(nn.Module):
+#     def __init__(self, encoder_decoder, stage="cebra"):
+#         super().__init__()
+#         assert stage in ("cebra", "rnn", "logits")
+#         self.ed = encoder_decoder
+#         self.stage = stage
+
+#     def forward(self, x):
+#         ed = self.ed
+#         lengths = torch.tensor([x.shape[1]] * x.shape[0], device=x.device)
+
+#         # h = ed.smoother(x)
+#         x = x.transpose(1,2)
+#         print("TRANSPOSED:", x.shape)
+#         h = ed.smoother(x)
+        
+#         if ed.cebra_unfolder:
+#             h = ed._apply_cebra(h, lengths)
+#             h, lengths = ed.unfolder(h, lengths)
+#         else:
+#             h, lengths = ed.unfolder(h, lengths)
+#             h = ed._apply_cebra(h, lengths)
+
+#         if self.stage == "cebra":
+#             return h
+
+#         h, _ = ed.rnn(h)
+#         if self.stage == "rnn":
+#             return h
+
+#         h = ed.final_decoder(h)
+#         return h
+
+
+# =====================================================================
+# rebuild the exact architecture + load trained weights
+# =====================================================================
+def load_trained_model(out_dir, device):
+    with open(os.path.join(out_dir, "args"), "rb") as f:
+        model_args = pickle.load(f)
+
+    is_speech = model_args.get("is_speech", True)
+    is_nejm = model_args.get("is_nejm", False)
+    neural_dim = (256 if not is_nejm else 512) if is_speech else 192
+    num_classes = 41 if is_speech else 32
+
+    model = Encoder_Decoder(
+        neural_dim,
+        model_args["ceb_out"],
+        model_args["kernel"],
+        model_args["stride"],
+        num_classes,
+        model_args["hidden"],
+        model_args["layers"],
+        model_args["dropout"],
+        model_args["bidir"],
+        model_args["cebra_unfolder"],
+        model_args.get("gru", True),
+        2.0,
+        gauss_in=model_args.get("gauss_in", True),
+        no_rnn=model_args.get("no_rnn", False),
+        cebra_bn=model_args.get("ceb_bn", False),
+        cebra_window_10=model_args.get("cebra_window_10", False),
+    ).to(device)
+
+    state = torch.load(os.path.join(out_dir, "modelWeights"), map_location=device)
+    model.load_state_dict(state)
+    model.eval()  # disable dropout so attribution is deterministic
+    print(f"loaded model from {out_dir} | neural_dim={neural_dim} | num_classes={num_classes} "
+          f"| ceb_out={model_args['ceb_out']} | hidden={model_args['hidden']} | bidir={model_args['bidir']} "
+          f"| cebra_unfolder={model_args['cebra_unfolder']} | no_rnn={model_args.get('no_rnn', False)}")
+    return model, model_args
+
+
+# =====================================================================
+# pull ONE real, already-preprocessed trial from the same test split
+# trainer.py used, so smoothing/etc. stay consistent with training
+# =====================================================================
+def day_trial_to_flat_index(test_days, day_idx, trial_in_day):
+    """SpeechDataset flattens all days' trials into one list, in order
+    (day0-trial0, day0-trial1, ..., day1-trial0, ...). This converts a
+    human-readable (day_idx, trial_in_day) into that flat index."""
+    if day_idx >= len(test_days):
+        raise ValueError(f"day_idx={day_idx} out of range, test split has {len(test_days)} days")
+    n_trials_this_day = len(test_days[day_idx]["sentenceDat"])
+    if trial_in_day >= n_trials_this_day:
+        raise ValueError(f"trial_in_day={trial_in_day} out of range, "
+                          f"day {day_idx} only has {n_trials_this_day} trials")
+    offset = sum(len(test_days[d]["sentenceDat"]) for d in range(day_idx))
+    return offset + trial_in_day
+
+
+# def get_reference_trial(model_args, device, trial_index=None, day_idx=None, trial_in_day=None):
+#     with open(model_args["datasetPath"], "rb") as f:
+#         loadedData = pickle.load(f)
+
+#     gauss_in = model_args.get("gauss_in", True)
+#     is_speech = model_args.get("is_speech", True)
+
+#     if is_speech:
+#         # gauss=not gauss_in: avoids double-smoothing when the model already
+#         # smooths internally (gauss_in=True), matching trainer.py exactly.
+#         test_ds = SpeechDataset(loadedData["test"], gauss=not gauss_in)
+#     else:
+#         test_ds = HandwritingDataset(loadedData["test"])
+
+#     if day_idx is not None:
+#         trial_index = day_trial_to_flat_index(loadedData["test"], day_idx, trial_in_day or 0)
+#         print(f"day_idx={day_idx}, trial_in_day={trial_in_day or 0} -> flat trial_index={trial_index}")
+#     elif trial_index is None:
+#         trial_index = 0
+
+#     x, y, x_len, y_len, day = test_ds[trial_index]
+#     print(f"reference trial: flat_index={trial_index} (belongs to day={day})")
+#     return x.unsqueeze(0).to(device)  # (1, T, F)
+
+def get_reference_trial(
+    model_args,
+    device,
+    trial_index=None,
+    day_idx=None,
+    trial_in_day=None,
+):
+    dataset_path = model_args["datasetPath"]
+    gauss_in = model_args.get("gauss_in", True)
+    is_speech = model_args.get("is_speech", True)
+
+    # ==========================================================
+    # SPEECH
+    # ==========================================================
+    if is_speech:
+        with open(dataset_path, "rb") as f:
+            loadedData = pickle.load(f)
+
+        test_ds = SpeechDataset(
+            loadedData["test"],
+            gauss=not gauss_in
+        )
+
+        if day_idx is not None:
+            trial_index = day_trial_to_flat_index(
+                loadedData["test"],
+                day_idx,
+                trial_in_day or 0,
+            )
+
+            print(
+                f"speech: day_idx={day_idx}, "
+                f"trial_in_day={trial_in_day or 0} "
+                f"-> flat trial_index={trial_index}"
+            )
+
+        elif trial_index is None:
+            trial_index = 0
+
+        x, y, x_len, y_len, day = test_ds[trial_index]
+
+        print(
+            f"reference speech trial: "
+            f"flat_index={trial_index}, day={day}, "
+            f"shape={tuple(x.shape)}"
+        )
+
+        return x.unsqueeze(0).to(device)
+
+    # ==========================================================
+    # NLP21
+    # ==========================================================
+    print("Loading NLP21 evaluation data from directory:")
+    print(dataset_path)
+
+    eval_dirs = [
+        (
+            "no_recalibration",
+            os.path.join(
+                dataset_path,
+                "online_evaluation_data",
+                "no_recalibration",
+                "mat",
+            ),
+        ),
+        (
+            "recalibration",
+            os.path.join(
+                dataset_path,
+                "online_evaluation_data",
+                "recalibration",
+                "mat",
+            ),
+        ),
+    ]
+
+    # Each entry will correspond to ONE .mat file/session
+    sessions = []
+
+    for split_name, path in eval_dirs:
+        print(f"loading {split_name}: {path}")
+
+        items, borders = get_nlp21_input(
+            path,
+            norm=True,
+            gauss=not gauss_in,
+            train=False,
+            valid=False,
+            return_borders=True,
+            gauss_sigma=2.0,
+        )
+
+        # borders contains start index of each .mat file
+        ends = borders[1:] + [len(items)]
+
+        for file_idx, (start, end) in enumerate(zip(borders, ends)):
+            sessions.append(
+                {
+                    "split": split_name,
+                    "file_idx": file_idx,
+                    "items": items[start:end],
+                }
+            )
+
+    print(f"Found {len(sessions)} NLP21 sessions/files")
+
+    # ----------------------------------------------------------
+    # day_idx means .mat/session index here
+    # ----------------------------------------------------------
+    if day_idx is not None:
+        if day_idx < 0 or day_idx >= len(sessions):
+            raise ValueError(
+                f"day_idx={day_idx} invalid. "
+                f"Available session indices: 0..{len(sessions)-1}"
+            )
+
+        sess = sessions[day_idx]
+        items = sess["items"]
+
+        ti = trial_in_day or 0
+
+        if ti < 0 or ti >= len(items):
+            raise ValueError(
+                f"trial_in_day={ti} invalid for session {day_idx}. "
+                f"This session contains {len(items)} trials."
+            )
+
+        x, y, d = items[ti]
+
+        print("==========================================")
+        print("NLP21 reference")
+        print(f"session index : {day_idx}")
+        print(f"split         : {sess['split']}")
+        print(f"file index    : {sess['file_idx']}")
+        print(f"trial         : {ti}")
+        print(f"x shape       : {tuple(x.shape)}")
+        print("==========================================")
+
+    # ----------------------------------------------------------
+    # alternatively choose one flat trial
+    # ----------------------------------------------------------
+    else:
+        flat_items = []
+
+        for sess in sessions:
+            flat_items.extend(sess["items"])
+
+        if trial_index is None:
+            trial_index = 0
+
+        if trial_index < 0 or trial_index >= len(flat_items):
+            raise ValueError(
+                f"trial_index={trial_index} invalid. "
+                f"Total trials={len(flat_items)}"
+            )
+
+        x, y, d = flat_items[trial_index]
+
+        print(
+            f"NLP21 flat reference trial={trial_index}, "
+            f"shape={tuple(x.shape)}"
+        )
+
+    return x.unsqueeze(0).to(device)
+
+# =====================================================================
+# run attribution for one stage
+# =====================================================================
+def run_attribution_for_stage(model, x_ref, stage, out_dim, out_dir, device, tag):
+    wrapper = EncoderDecoderStageWrapper(model, stage=stage).to(device)
+    wrapper.eval()
+
+    x_ref_2d = x_ref.squeeze(0) if x_ref.dim() == 3 else x_ref   # (1,T,F) -> (T,F)
+    x_tensor = x_ref_2d.clone().detach().to(device)
+    x_tensor.requires_grad_(True)
+
+    method = cebra.attribution.init(
+        name="jacobian-based-batched",
+        model=wrapper,
+        input_data=x_tensor,
+        output_dimension=out_dim,
+    )
+    # batch_size = number of SAMPLES (x_tensor.shape[0]), not sequence length
+    # result = method.compute_attribution_map(batch_size=x_tensor.shape[0])
+    with torch.backends.cudnn.flags(enabled=False):
+        result = method.compute_attribution_map(
+            batch_size=x_tensor.shape[0]
+        )
+
+    print("input shape:", x_tensor.shape)
+    print("jf raw:", result["jf"].shape)
+
+    jf = result["jf"]
+    jf_inv = result.get("jf-inv-svd", result.get("jf-inv-lsq", result.get("jf-inv")))
+    print("========== ATTR SHAPES ==========")
+    print("x_ref shape:", x_ref.shape)
+    print("result keys:", result.keys())
+    print("jf type:", type(jf))
+    print("jf shape:", jf.shape if hasattr(jf, "shape") else None)
+    
+    print("jf_inv type:", type(jf_inv))
+    print("jf_inv shape:", jf_inv.shape if hasattr(jf_inv, "shape") else None)
+    print("=================================")
+    
+    
+    torch.save(jf, os.path.join(out_dir, f"{tag}_{stage}_jf.pt"))
+    torch.save(jf_inv, os.path.join(out_dir, f"{tag}_{stage}_jf_inv.pt"))
+
+    save_heatmap(reduce_attr_map(jf), os.path.join(out_dir, f"{tag}_{stage}_jf.png"),
+                 f"{tag} [{stage}] - Jacobian")
+    save_heatmap(reduce_attr_map(jf_inv), os.path.join(out_dir, f"{tag}_{stage}_jf_inv.png"),
+                 f"{tag} [{stage}] - inverse Jacobian")
+
+    cleanup(wrapper, x_tensor, method, result)
+
+
+# =====================================================================
+# main
+# =====================================================================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out_dir", required=True, help="same out_dir used for start_trainer.py")
+    parser.add_argument("--stages", nargs="+", default=["cebra", "rnn", "logits"],
+                         choices=["cebra", "rnn", "logits"])
+    parser.add_argument("--trial_index", type=int, default=None,
+                         help="flat index into the whole test split (all days concatenated). "
+                              "Ignored if --day_idx is given.")
+    parser.add_argument("--day_idx", type=int, default=None,
+                         help="pick a specific test-split day (0-based) instead of a flat index")
+    parser.add_argument("--trial_in_day", type=int, default=0,
+                         help="trial index within --day_idx (default: first trial of that day)")
+    parser.add_argument("--tag", type=str, default="attr")
+    cli_args = parser.parse_args()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model, model_args = load_trained_model(cli_args.out_dir, device)
+    x_ref = get_reference_trial(model_args, device, cli_args.trial_index,
+                                 cli_args.day_idx, cli_args.trial_in_day)
+    print(f"reference trial shape: {tuple(x_ref.shape)}")
+
+    stages = list(cli_args.stages)
+    if model_args.get("no_rnn", False) and "rnn" in stages:
+        print("no_rnn=True for this run -- 'rnn' stage doesn't exist, skipping it")
+        stages = [s for s in stages if s != "rnn"]
+
+    stage_dims = {
+        "cebra": model_args["ceb_out"],
+        "rnn": model_args["hidden"] * (2 if model_args["bidir"] else 1),
+        "logits": 41 if model_args.get("is_speech", True) else 32,
+    }
+
+    for stage in stages:
+        print(f"\n=== attribution: stage={stage} | output_dim={stage_dims[stage]} ===")
+        run_attribution_for_stage(model, x_ref, stage, stage_dims[stage],
+                                   cli_args.out_dir, device, tag=cli_args.tag)
+
+    print("\nDONE")
     
 
 
