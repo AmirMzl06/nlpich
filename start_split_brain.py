@@ -39,7 +39,7 @@ from edit_distance import SequenceMatcher
 
 from utils.data_loader import get_input
 from utils.dataset import HandwritingDataset, charset
-from utils.split_brain_model import build_model
+from utils.split_brain_model import build_model, upgrade_state_dict
 
 SEED_DIR = "seed_model_training_data/mat/"
 NO_RECAL_DIR = "online_evaluation_data/no_recalibration/mat/"
@@ -60,13 +60,16 @@ def get_parser():
     p.add_argument("--aux", type=str, default="M", choices=["none", "T", "L", "M"],
                    help="T: predict other view's activity | L: predict other view's latent | M: both")
     p.add_argument("--split", type=str, default="array", choices=["array", "random", "interleave", "none"],
-                   help="array: channels 0-95 | 96-191; none: one encoder on all channels (baseline)")
+                   help="array: contiguous blocks (2 views: 0-95 | 96-191); none: one encoder on all channels")
     p.add_argument("--split_seed", type=int, default=0)
+    p.add_argument("--n_views", type=int, default=2, help="number of channel groups (must divide 192)")
     p.add_argument("--eval_only", action="store_true", help="load out_dir/modelWeights and only evaluate")
     p.add_argument("--no_resume", action="store_true", help="ignore out_dir/checkpoint.pt")
     p.add_argument("--device", type=str, default="cuda")
     # encoder
-    p.add_argument("--arch", type=str, default="conv", choices=["conv", "gru", "transformer", "conformer"])
+    p.add_argument("--arch", type=str, default="conv", choices=["conv", "tcn", "gru", "transformer", "conformer"],
+                   help="tcn = conv with dilations 1, 2, 4, 8")
+    p.add_argument("--share_trunk", action="store_true", help="views keep their own stem but share trunk + projection")
     p.add_argument("--d_model", type=int, default=256)
     p.add_argument("--emb_dim", type=int, default=32, help="bottleneck per view (concat = 2x)")
     p.add_argument("--enc_layers", type=int, default=4, help="trunk depth (use ~2 for gru)")
@@ -90,6 +93,9 @@ def get_parser():
     p.add_argument("--head_hidden", type=int, default=256, help="0 = linear heads")
     p.add_argument("--ema_decay", type=float, default=0.996)
     p.add_argument("--no_ema", action="store_true", help="L targets from the online encoder (stop-grad)")
+    p.add_argument("--swap_prob", type=float, default=0.0,
+                   help="train only: per sample/view, feed the decoder the prediction of that view from another "
+                        "view instead of its own embedding (needs aux L or M)")
     # noise (training only)
     p.add_argument("--input_noise_sd", type=float, default=0.0, help="Gaussian noise on the neural input")
     p.add_argument("--input_offset_sd", type=float, default=0.0, help="per-trial constant offset on the input")
@@ -98,9 +104,9 @@ def get_parser():
     p.add_argument("--batchSize", type=int, default=16)
     p.add_argument("--nBatch", type=int, default=20000, help="CTC steps (e2e / after pretraining)")
     p.add_argument("--pretrain_steps", type=int, default=10000)
-    p.add_argument("--optim", type=str, default="auto", choices=["auto", "project", "adamw"],
-                   help="project: Adam(eps=0.1) + linear decay as utils/trainer.py; adamw: AdamW + warmup + cosine; "
-                        "auto: project for conv/gru, adamw for transformer/conformer")
+    p.add_argument("--optim", type=str, default="project", choices=["project", "adamw"],
+                   help="project: Adam(lr 0.02->0.002, eps=0.1) exactly as utils/trainer.py; "
+                        "adamw: AdamW + warmup + cosine")
     p.add_argument("--lrStart", type=float, default=0.02)
     p.add_argument("--lrEnd", type=float, default=0.002)
     p.add_argument("--adam_eps", type=float, default=0.1)
@@ -122,13 +128,13 @@ def get_parser():
 def finalize_args(args):
     if args["conv_kernel"] <= 0:
         args["conv_kernel"] = 15 if args["arch"] == "conformer" else 5
-    if args["optim"] == "auto":
-        args["optim"] = "adamw" if args["arch"] in ("transformer", "conformer") else "project"
     if args["split"] == "none" and args["aux"] != "none":
         print("split=none -> no split-brain loss, setting aux=none")
         args["aux"] = "none"
     if args["mode"] != "e2e" and args["aux"] == "none":
         raise ValueError(f"mode={args['mode']} needs a split-brain loss (aux != none)")
+    if args["swap_prob"] > 0 and args["aux"] not in ("L", "M"):
+        raise ValueError("--swap_prob needs --aux L or M")
     return args
 
 
@@ -268,7 +274,7 @@ def print_final(summary, loss):
     print(f"seen days   (held-out block of training sessions) : {summary['seen']:.4f}   ({n['seen']} trials)")
     print(f"unseen days, no_recalibration                      : {summary['no_recal']:.4f}   ({n['no_recal']} trials)")
     print(f"unseen days, recalibration                         : {summary['recal']:.4f}   ({n['recal']} trials)")
-    print(f"unseen days, all  (= utils/trainer.py test set)    : {summary['unseen_all']:.4f}")
+    print(f"unseen days, all  (trials of trainer.py's test set): {summary['unseen_all']:.4f}")
     print(f"eval_single_model.py pool (seen + unseen)          : {summary['eval_single_pool']:.4f}")
     print("-" * 64)
     print("per session:")
@@ -297,19 +303,21 @@ def final_eval(model, args, device, eval_items, eval_tags):
 # =====================================================================
 @torch.no_grad()
 def channel_correlation_report(model, items, device, max_trials=100):
-    """Mean |corr| (smoothed input) within / between the two views; within >> between supports the array split."""
-    if model.split == "none":
+    """Mean |corr| (smoothed input) within / between views; within >> between supports the array split."""
+    if model.n_views < 2:
         return
     x = torch.cat([model.smoother(it[0][None].float().to(device))[0] for it in items[:max_trials]], 0)
     c = torch.corrcoef(x.T).nan_to_num(0.0).abs().cpu()
-    a, b = model.idx_A.cpu(), model.idx_B.cpu()
+    views = [v.cpu() for v in model.view_idx]
 
     def off_diag_mean(m):
         n = m.shape[0]
         return ((m.sum() - m.diagonal().sum()) / (n * n - n)).item()
 
-    print(f"[split check] mean |corr| within A: {off_diag_mean(c[a][:, a]):.4f} | "
-          f"within B: {off_diag_mean(c[b][:, b]):.4f} | between A-B: {c[a][:, b].mean().item():.4f}")
+    within = [off_diag_mean(c[v][:, v]) for v in views]
+    between = [c[a][:, b].mean().item() for i, a in enumerate(views) for b in views[i + 1:]]
+    print(f"[split check] mean |corr| within views: " + " | ".join(f"{w:.4f}" for w in within)
+          + f" | between views: {sum(between) / len(between):.4f}")
 
 
 # =====================================================================
@@ -379,7 +387,7 @@ def train(args, model, device, train_items, eval_items, eval_tags):
     resume = None
     if os.path.exists(ckpt_path) and not args["no_resume"]:
         resume = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(resume["model"])
+        model.load_state_dict(upgrade_state_dict(resume["model"]))
         print(f"resuming from phase {resume['phase_idx']} step {resume['step']}")
 
     stats = {"step": [], "phase": [], "cer_seen": [], "cer_unseen": []}
@@ -435,11 +443,16 @@ def train(args, model, device, train_items, eval_items, eval_tags):
                         loss = loss + args["lambda_L"] * aux["L"]
                     logs.update({k: float(v) for k, v in aux.items()})
 
-            if torch.isfinite(loss):
-                bad_streak = 0
+            # a finite loss can still give inf/NaN gradients (bf16 overflow); stepping on them
+            # would turn the weights into NaN for good, so check both before the update
+            ok = bool(torch.isfinite(loss))
+            if ok:
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(params, max_norm=args["grad_clip"])
+                grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=args["grad_clip"])
+                ok = bool(torch.isfinite(grad_norm))
+            if ok:
+                bad_streak = 0
                 opt.step()
                 if use_aux and model.use_L:
                     model.update_ema(args["ema_decay"])
@@ -447,10 +460,11 @@ def train(args, model, device, train_items, eval_items, eval_tags):
                     running[k] = running.get(k, 0.0) + v
                 running["_n"] = running.get("_n", 0) + 1
             else:  # skip the update, keep the schedule / eval / checkpoint cadence
+                opt.zero_grad(set_to_none=True)
                 bad_streak += 1
-                print(f"[{name}] non-finite loss at step {step + 1}, update skipped ({bad_streak} in a row)")
-                if bad_streak >= 10:
-                    raise RuntimeError("10 non-finite losses in a row, stopping")
+                print(f"[{name}] non-finite loss/gradient at step {step + 1}, update skipped ({bad_streak} in a row)")
+                if bad_streak >= 50:
+                    raise RuntimeError("50 non-finite losses/gradients in a row, stopping")
             sched.step()
 
             if (step + 1) % args["log_every"] == 0:
@@ -492,7 +506,8 @@ def main():
             model_args = pickle.load(f)
         model_args.update({k: args[k] for k in ("datasetPath", "out_dir", "eval_batch_size", "no_amp", "device")})
         model = build_model(model_args).to(device)
-        model.load_state_dict(torch.load(os.path.join(args["out_dir"], "modelWeights"), map_location=device))
+        model.load_state_dict(upgrade_state_dict(
+            torch.load(os.path.join(args["out_dir"], "modelWeights"), map_location=device)))
         eval_items, eval_tags = load_eval_items(model_args["datasetPath"])
         final_eval(model, model_args, device, eval_items, eval_tags)
         return
@@ -507,7 +522,8 @@ def main():
     model = build_model(args).to(device)
     n_enc = sum(p.numel() for p in model.encoders.parameters())
     n_dec = sum(p.numel() for p in model.decoder_parameters())
-    print(f"model: split={args['split']} arch={args['arch']} aux={args['aux']} mode={args['mode']} | "
+    print(f"model: split={args['split']} views={model.n_views} arch={args['arch']} share_trunk={args['share_trunk']} "
+          f"aux={args['aux']} swap={args['swap_prob']} mode={args['mode']} optim={args['optim']} | "
           f"encoders {n_enc / 1e6:.2f}M, decoder {n_dec / 1e6:.2f}M params")
 
     train_items = load_train_items(args["datasetPath"])
