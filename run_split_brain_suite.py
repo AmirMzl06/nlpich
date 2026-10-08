@@ -36,6 +36,16 @@ RUNS = [
     ("gru_M",           "--arch gru --enc_layers 2 --aux M",               2, "GRU encoder + split-brain"),
     ("conformer_none",  "--arch conformer --split none",                   2, "Conformer encoder baseline"),
     ("conformer_M",     "--arch conformer --aux M",                        2, "Conformer encoder + split-brain"),
+    # ---- tier 3: controls + new split-brain architectures (all without noise) ----
+    ("M_freeze_rand",   "--mode pretrain_freeze --aux M --pretrain_steps 0", 3, "control: random frozen encoder + CTC"),
+    ("M_freeze_lam10",  "--mode pretrain_freeze --aux M --lambda_T 10 --lambda_L 10",
+                                                                           3, "frozen encoder after a stronger pretraining"),
+    ("M_lam10",         "--aux M --lambda_T 10 --lambda_L 10",             3, "M with 10x split-brain weight"),
+    ("M_swap",          "--aux M --swap_prob 0.3",                         3, "M + decoder sometimes gets cross-predicted views"),
+    ("M_shared",        "--aux M --share_trunk",                           3, "M with a trunk shared by the views"),
+    ("M_views4",        "--aux M --n_views 4 --emb_dim 16",                3, "M with 4 channel groups of 48"),
+    ("tcn_none",        "--arch tcn --split none",                         3, "dilated conv (TCN) encoder baseline"),
+    ("tcn_M",           "--arch tcn --aux M",                              3, "TCN encoder + split-brain"),
 ]
 
 COLS = [("seen", "seen"), ("no_recal", "unseen_norecal"), ("recal", "unseen_recal"),
@@ -47,7 +57,8 @@ def parse():
     p.add_argument("--datasetPath", type=str, default="/data/hossein/mm_project/CORP_data_release")
     p.add_argument("--root", type=str, default="sb_runs", help="all run folders and logs go here")
     p.add_argument("--gpus", type=str, default="0", help="comma separated GPU ids, one run per GPU at a time")
-    p.add_argument("--tier", type=int, default=2, help="1 = core runs only, 2 = core + ablations")
+    p.add_argument("--tier", type=int, default=3, help="run every tier <= this (1 core, 2 ablations, 3 new archs)")
+    p.add_argument("--tiers", type=str, default="", help="comma separated tiers to run exactly, e.g. '3' or '2,3'")
     p.add_argument("--only", type=str, default="", help="comma separated run names to run (default: all of the tier)")
     p.add_argument("--extra", type=str, default="", help="extra flags appended to every run, e.g. '--seed 1'")
     p.add_argument("--summary", action="store_true", help="only print the result table")
@@ -56,7 +67,11 @@ def parse():
 
 
 def selected_runs(args):
-    runs = [r for r in RUNS if r[2] <= args.tier]
+    if args.tiers:
+        wanted = {int(t) for t in args.tiers.split(",")}
+        runs = [r for r in RUNS if r[2] in wanted]
+    else:
+        runs = [r for r in RUNS if r[2] <= args.tier]
     if args.only:
         names = set(args.only.split(","))
         unknown = names - {r[0] for r in RUNS}
