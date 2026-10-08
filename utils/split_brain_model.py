@@ -1,4 +1,4 @@
- """Split-brain (cross-view prediction) model for brain-to-text decoding.
+"""Split-brain (cross-view prediction) model for brain-to-text decoding.
 
 The input channels are split into K disjoint views (K=2: e.g. the two Utah arrays).
 Each view has its own encoder (optionally a shared trunk); an encoder never sees the
