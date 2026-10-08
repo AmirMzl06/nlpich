@@ -1,13 +1,16 @@
-"""Split-brain (cross-view prediction) model for brain-to-text decoding.
+ """Split-brain (cross-view prediction) model for brain-to-text decoding.
 
-The input channels are split into two disjoint views (e.g. the two Utah arrays).
-Each view has its own encoder; the encoders never see the other view.
-Their bottleneck embeddings are concatenated and decoded with CTC, and during
-training each view's embedding is asked to predict the other view:
+The input channels are split into K disjoint views (K=2: e.g. the two Utah arrays).
+Each view has its own encoder (optionally a shared trunk); an encoder never sees the
+other views. The bottleneck embeddings are concatenated and decoded with CTC, and
+during training each view's embedding is asked to predict the other views:
 
-    T: the other view's (smoothed, quantized) activity   -> cross-entropy
-    L: the other view's latent from an EMA target encoder -> cosine (BYOL style)
+    T: the other views' (smoothed, quantized) activity    -> cross-entropy
+    L: the other views' latents from EMA target encoders  -> cosine (BYOL style)
     M: both
+
+Optional: swap_prob > 0 feeds the decoder, per sample and view, the prediction of that
+view's latent made from another view instead of its own embedding (needs L/M).
 
 forward(x, lengths) -> (logits, out_lengths), same signature as utils.model.Encoder_Decoder.
 """
@@ -21,22 +24,35 @@ import torch.nn.functional as F
 from utils.augmentation import GaussianSmoothing
 
 
-def make_split(n_channels, split, seed=0):
-    """Return (idx_A, idx_B) channel index tensors, or None for split='none'."""
+def make_views(n_channels, split, n_views=2, seed=0):
+    """(K, n_channels // K) channel indices per view; split='none' -> one view with all channels."""
     if split == "none":
-        return None
-    half = n_channels // 2
-    if split == "array":
-        idx_a, idx_b = torch.arange(0, half), torch.arange(half, n_channels)
-    elif split == "interleave":
-        idx_a, idx_b = torch.arange(0, n_channels, 2), torch.arange(1, n_channels, 2)
+        return torch.arange(n_channels)[None]
+    if n_views < 2 or n_channels % n_views:
+        raise ValueError(f"n_views={n_views} must be >= 2 and divide {n_channels}")
+    if split == "array":  # contiguous blocks (K=2: 0-95 | 96-191)
+        order = torch.arange(n_channels)
+    elif split == "interleave":  # channel c goes to view c % K
+        order = torch.arange(n_channels).view(-1, n_views).t().reshape(-1)
     elif split == "random":
-        g = torch.Generator().manual_seed(seed)
-        perm = torch.randperm(n_channels, generator=g)
-        idx_a, idx_b = perm[:half].sort().values, perm[half:].sort().values
+        order = torch.randperm(n_channels, generator=torch.Generator().manual_seed(seed))
     else:
         raise ValueError(f"unknown split '{split}'")
-    return idx_a, idx_b
+    return order.view(n_views, -1).sort(dim=1).values
+
+
+def upgrade_state_dict(sd):
+    """Map checkpoints of the first (2-view) version to the current parameter names."""
+    sd = dict(sd)
+    if "idx_A" in sd:
+        sd["view_idx"] = torch.stack([sd.pop("idx_A"), sd.pop("idx_B")])
+    if "idx_all" in sd:
+        sd["view_idx"] = sd.pop("idx_all")[None]
+    for old, new in (("head_AB.", "heads_T.0."), ("head_BA.", "heads_T.1."),
+                     ("pred_AB.", "preds_L.0."), ("pred_BA.", "preds_L.1.")):
+        for k in [k for k in sd if k.startswith(old)]:
+            sd[new + k[len(old):]] = sd.pop(k)
+    return sd
 
 
 def output_lengths(lengths, kernel, stride):
@@ -54,10 +70,10 @@ def valid_mask(out_len, n_steps):
 # trunks: (B, T', d) + pad_mask (B, T', True = pad) -> (B, T', out_dim)
 # =====================================================================
 class ConvBlock(nn.Module):
-    def __init__(self, d, kernel, dropout):
+    def __init__(self, d, kernel, dropout, dilation=1):
         super().__init__()
         self.norm = nn.LayerNorm(d)
-        self.dw = nn.Conv1d(d, d, kernel, padding=kernel // 2, groups=d)
+        self.dw = nn.Conv1d(d, d, kernel, padding=dilation * (kernel // 2), dilation=dilation, groups=d)
         self.pw1 = nn.Linear(d, 2 * d)
         self.pw2 = nn.Linear(2 * d, d)
         self.drop = nn.Dropout(dropout)
@@ -70,12 +86,13 @@ class ConvBlock(nn.Module):
 
 
 class ConvTrunk(nn.Module):
-    """Local temporal conv net (ConvNeXt-1D style blocks)."""
+    """Temporal conv net (ConvNeXt-1D style blocks); dilated=True gives a TCN (dilation 1, 2, 4, 8, ...)."""
 
-    def __init__(self, d, n_layers, dropout, conv_kernel=5):
+    def __init__(self, d, n_layers, dropout, conv_kernel=5, dilated=False):
         super().__init__()
         assert conv_kernel % 2 == 1, "conv_kernel must be odd"
-        self.blocks = nn.ModuleList([ConvBlock(d, conv_kernel, dropout) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList([ConvBlock(d, conv_kernel, dropout, 2 ** (i % 4) if dilated else 1)
+                                     for i in range(n_layers)])
         self.norm = nn.LayerNorm(d)
         self.out_dim = d
 
@@ -179,6 +196,8 @@ class ConformerTrunk(nn.Module):
 def build_trunk(arch, d, n_layers, dropout, nhead, conv_kernel):
     if arch == "conv":
         return ConvTrunk(d, n_layers, dropout, conv_kernel)
+    if arch == "tcn":
+        return ConvTrunk(d, n_layers, dropout, conv_kernel, dilated=True)
     if arch == "gru":
         return GRUTrunk(d, n_layers, dropout)
     if arch == "transformer":
@@ -223,11 +242,11 @@ def mlp(d_in, d_hidden, d_out):
 # full model
 # =====================================================================
 class SplitBrainNet(nn.Module):
-    def __init__(self, n_channels=192, n_classes=32, split="array", split_seed=0,
+    def __init__(self, n_channels=192, n_classes=32, split="array", split_seed=0, n_views=2,
                  arch="conv", d_model=256, emb_dim=32, enc_layers=4, enc_dropout=0.1, nhead=4, conv_kernel=5,
-                 kernel=32, stride=4, smooth_sigma=2.0,
+                 share_trunk=False, kernel=32, stride=4, smooth_sigma=2.0,
                  decoder="gru", hidden=1024, layers=5, dropout=0.4, bidir=True,
-                 aux="none", n_bins=16, target_window="center", head_hidden=256, use_ema=True):
+                 aux="none", n_bins=16, target_window="center", head_hidden=256, use_ema=True, swap_prob=0.0):
         super().__init__()
         if aux != "none" and split == "none":
             raise ValueError("split-brain aux loss needs a split (split != 'none')")
@@ -235,26 +254,35 @@ class SplitBrainNet(nn.Module):
         self.aux = aux
         self.use_T = aux in ("T", "M")
         self.use_L = aux in ("L", "M")
+        if swap_prob > 0 and not self.use_L:
+            raise ValueError("swap_prob needs the latent predictors (aux L or M)")
         self.n_bins = n_bins
         self.target_window = target_window
         self.use_ema = use_ema
+        self.swap_prob = swap_prob
+        self.emb_dim = emb_dim
         self.emb_noise_sd = 0.0  # set by the trainer, used only in train mode
 
         self.smoother = GaussianSmoothing(n_channels, 20, smooth_sigma, dim=1) if smooth_sigma > 0 else nn.Identity()
 
-        def enc(in_ch, out_dim):
-            return ViewEncoder(in_ch, arch, d_model, out_dim, enc_layers, kernel, stride, enc_dropout, nhead, conv_kernel)
-
-        sp = make_split(n_channels, split, split_seed)
         self.split = split
-        if sp is None:
-            self.register_buffer("idx_all", torch.arange(n_channels))
-            self.encoders = nn.ModuleList([enc(n_channels, 2 * emb_dim)])
-        else:
-            self.register_buffer("idx_A", sp[0])
-            self.register_buffer("idx_B", sp[1])
-            self.encoders = nn.ModuleList([enc(len(sp[0]), emb_dim), enc(len(sp[1]), emb_dim)])
-        z_dim = 2 * emb_dim
+        views = make_views(n_channels, split, n_views, split_seed)
+        self.n_views = views.shape[0]
+        self.register_buffer("view_idx", views)
+        # channels each view has to predict = all channels of the other views
+        comp = [torch.cat([views[j] for j in range(self.n_views) if j != i]).sort().values
+                for i in range(self.n_views)] if self.n_views > 1 else []
+        self.register_buffer("comp_idx", torch.stack(comp) if comp else torch.zeros(0, dtype=torch.long),
+                             persistent=False)
+
+        view_emb = emb_dim if self.n_views > 1 else 2 * emb_dim  # split=none keeps the same decoder input size
+        self.encoders = nn.ModuleList([
+            ViewEncoder(views.shape[1], arch, d_model, view_emb, enc_layers, kernel, stride, enc_dropout,
+                        nhead, conv_kernel) for _ in range(self.n_views)])
+        if share_trunk:  # separate stems (different channels), one shared trunk + projection
+            for e in self.encoders[1:]:
+                e.trunk, e.proj = self.encoders[0].trunk, self.encoders[0].proj
+        z_dim = view_emb * self.n_views
 
         if decoder == "gru":
             self.rnn = nn.GRU(z_dim, hidden, layers, batch_first=True, bidirectional=bidir,
@@ -269,18 +297,18 @@ class SplitBrainNet(nn.Module):
         if self.use_T:
             if n_bins < 2:
                 raise ValueError("n_bins must be >= 2")
-            n_a, n_b = len(self.idx_A), len(self.idx_B)
-            self.head_AB = mlp(emb_dim, head_hidden, n_b * n_bins)  # A predicts B
-            self.head_BA = mlp(emb_dim, head_hidden, n_a * n_bins)  # B predicts A
+            self.heads_T = nn.ModuleList([mlp(emb_dim, head_hidden, self.comp_idx.shape[1] * n_bins)
+                                          for _ in range(self.n_views)])
             self.register_buffer("bin_edges", torch.zeros(n_channels, n_bins - 1))
             self.register_buffer("bin_entropy", torch.zeros(n_channels))  # marginal entropy of each channel's bins
             self.register_buffer("bin_weight", torch.ones(n_channels))  # 0 for constant channels
             self.register_buffer("bins_fitted", torch.zeros((), dtype=torch.bool))
         if self.use_L:
-            self.pred_AB = mlp(emb_dim, head_hidden, emb_dim)
-            self.pred_BA = mlp(emb_dim, head_hidden, emb_dim)
+            # view i predicts the latents of the other views, in increasing view order
+            self.preds_L = nn.ModuleList([mlp(emb_dim, head_hidden, (self.n_views - 1) * emb_dim)
+                                          for _ in range(self.n_views)])
             if use_ema:
-                self.ema_encoders = copy.deepcopy(self.encoders)
+                self.ema_encoders = copy.deepcopy(self.encoders)  # keeps the trunk sharing
                 for p in self.ema_encoders.parameters():
                     p.requires_grad_(False)
         self._cache = {}
@@ -289,7 +317,7 @@ class SplitBrainNet(nn.Module):
     def encoder_side_parameters(self):
         """Encoders + split-brain heads (everything trained in the pretraining phase)."""
         mods = [self.encoders]
-        for name in ("head_AB", "head_BA", "pred_AB", "pred_BA"):
+        for name in ("heads_T", "preds_L"):
             if hasattr(self, name):
                 mods.append(getattr(self, name))
         return [p for m in mods for p in m.parameters()]
@@ -306,16 +334,36 @@ class SplitBrainNet(nn.Module):
 
     # ---------------- forward ----------------
     def _views(self, xs):
-        if self.split == "none":
-            return [xs]
-        return [xs.index_select(-1, self.idx_A), xs.index_select(-1, self.idx_B)]
+        return [xs.index_select(-1, self.view_idx[i]) for i in range(self.n_views)]
+
+    def _pred_of(self, preds, src, dst):
+        """Prediction of view dst's latent made from view src."""
+        k = dst if dst < src else dst - 1
+        return preds[src][..., k * self.emb_dim:(k + 1) * self.emb_dim]
+
+    def _swap(self, hs, preds):
+        """Per sample and view, replace the embedding by its prediction from a random other view."""
+        out = []
+        for i, h in enumerate(hs):
+            others = [j for j in range(self.n_views) if j != i]
+            cand = torch.stack([self._pred_of(preds, j, i) for j in others], 0)  # (K-1, B, T', E)
+            pick = torch.randint(len(others), (h.shape[0],), device=h.device)
+            sub = F.layer_norm(cand[pick, torch.arange(h.shape[0], device=h.device)].float(), (self.emb_dim,))
+            swap = torch.rand(h.shape[0], device=h.device) < self.swap_prob
+            out.append(torch.where(swap[:, None, None], sub, h.float()))
+        return out
 
     def encode(self, x, lengths):
         xs = self.smoother(x)
         out_len = output_lengths(lengths, self.kernel, self.stride)
         hs = [e(v, out_len) for e, v in zip(self.encoders, self._views(xs))]
-        self._cache = {"x": x, "xs": xs, "hs": hs, "out_len": out_len}
-        return torch.cat(hs, dim=-1), out_len
+        preds = None
+        parts = hs
+        if self.training and self.swap_prob > 0:
+            preds = [p(h) for p, h in zip(self.preds_L, hs)]
+            parts = self._swap(hs, preds)
+        self._cache = {"x": x, "xs": xs, "hs": hs, "preds": preds, "out_len": out_len}
+        return torch.cat(parts, dim=-1), out_len
 
     def decode(self, z):
         if self.training and self.emb_noise_sd > 0:
@@ -389,7 +437,7 @@ class SplitBrainNet(nn.Module):
         return (v * mask).sum() / mask.sum().clamp(min=1.0)
 
     def _ce(self, logits, target, weight, mask):
-        """Cross-entropy averaged over the (non-constant) channels of a view and the valid steps."""
+        """Cross-entropy averaged over the (non-constant) target channels and the valid steps."""
         B, T, _ = logits.shape
         logits = logits.float().view(B, T, -1, self.n_bins)
         ce = F.cross_entropy(logits.reshape(-1, self.n_bins), target.reshape(-1), reduction="none").view(B, T, -1)
@@ -411,9 +459,8 @@ class SplitBrainNet(nn.Module):
         Returns a dict with 'T' and/or 'L' losses plus a few diagnostics.
         """
         c = self._cache
-        h_a, h_b = c["hs"]
-        out_len = c["out_len"]
-        n_steps = h_a.shape[1]
+        hs, out_len = c["hs"], c["out_len"]
+        n_steps = hs[0].shape[1]
         mask = valid_mask(out_len, n_steps)
         x_tgt = c["x"] if x_clean is None else x_clean
         out = {}
@@ -423,26 +470,30 @@ class SplitBrainNet(nn.Module):
             with torch.no_grad(), torch.autocast("cuda", enabled=False):
                 # float32, exactly as in fit_bins
                 m = self.window_means(self.smoother(x_tgt.float()), n_steps)
-                t_a, t_b = self.quantize(m, self.idx_A), self.quantize(m, self.idx_B)
-            ce_ab = self._ce(self.head_AB(h_a), t_b, self.bin_weight[self.idx_B], mask)
-            ce_ba = self._ce(self.head_BA(h_b), t_a, self.bin_weight[self.idx_A], mask)
-            out["T"] = 0.5 * (ce_ab + ce_ba)
+            ces, gains = [], []
+            for i, h in enumerate(hs):
+                idx = self.comp_idx[i]
+                ce = self._ce(self.heads_T[i](h), self.quantize(m, idx), self.bin_weight[idx], mask)
+                ces.append(ce)
+                gains.append(self._marginal_entropy(idx) - ce.detach())
+            out["T"] = torch.stack(ces).mean()
             # nats per channel gained over the marginal (a lower bound on the cross-view information);
-            # <= 0 means the other view is not predicted better than its own histogram
-            out["T_gain"] = 0.5 * ((self._marginal_entropy(self.idx_B) - ce_ab)
-                                   + (self._marginal_entropy(self.idx_A) - ce_ba)).detach()
+            # <= 0 means the other views do not predict better than the channel's own histogram
+            out["T_gain"] = torch.stack(gains).mean()
 
         if self.use_L:
             with torch.no_grad():
                 tgt_encoders = self.ema_encoders if self.use_ema else self.encoders
                 xs = c["xs"] if x_clean is None else self.smoother(x_clean)
-                v_a, v_b = self._views(xs)
-                g_a, g_b = tgt_encoders[0](v_a, out_len), tgt_encoders[1](v_b, out_len)
-            out["L"] = 0.5 * (self._cos_loss(self.pred_AB(h_a), g_b, mask) + self._cos_loss(self.pred_BA(h_b), g_a, mask))
+                targets = [e(v, out_len) for e, v in zip(tgt_encoders, self._views(xs))]
+            preds = c["preds"] if c["preds"] is not None else [p(h) for p, h in zip(self.preds_L, hs)]
+            losses = [self._cos_loss(self._pred_of(preds, i, j), targets[j], mask)
+                      for i in range(self.n_views) for j in range(self.n_views) if j != i]
+            out["L"] = torch.stack(losses).mean()
 
-        with torch.no_grad():  # collapse monitor (both views): ~1 healthy, -> 0 collapsed
-            stds = [F.normalize(h.float()[mask], dim=-1).std(0).mean() * math.sqrt(h.shape[-1]) for h in (h_a, h_b)]
-            out["emb_std"] = 0.5 * (stds[0] + stds[1])
+        with torch.no_grad():  # collapse monitor (all views): ~1 healthy, -> 0 collapsed
+            stds = [F.normalize(h.float()[mask], dim=-1).std(0).mean() * math.sqrt(h.shape[-1]) for h in hs]
+            out["emb_std"] = torch.stack(stds).mean()
         return out
 
     @torch.no_grad()
@@ -456,13 +507,13 @@ class SplitBrainNet(nn.Module):
 def build_model(args):
     return SplitBrainNet(
         n_channels=192, n_classes=32,
-        split=args["split"], split_seed=args["split_seed"],
+        split=args["split"], split_seed=args["split_seed"], n_views=args.get("n_views", 2),
         arch=args["arch"], d_model=args["d_model"], emb_dim=args["emb_dim"],
         enc_layers=args["enc_layers"], enc_dropout=args["enc_dropout"], nhead=args["nhead"],
-        conv_kernel=args["conv_kernel"],
+        conv_kernel=args["conv_kernel"], share_trunk=args.get("share_trunk", False),
         kernel=args["kernel"], stride=args["stride"], smooth_sigma=args["smooth_sigma"],
         decoder=args["decoder"], hidden=args["hidden"], layers=args["layers"],
         dropout=args["dropout"], bidir=not args["no_bidir"],
         aux=args["aux"], n_bins=args["n_bins"], target_window=args["target_window"],
-        head_hidden=args["head_hidden"], use_ema=not args["no_ema"],
+        head_hidden=args["head_hidden"], use_ema=not args["no_ema"], swap_prob=args.get("swap_prob", 0.0),
     )
